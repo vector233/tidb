@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
@@ -30,13 +29,10 @@ import (
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/mock"
-	"github.com/pingcap/tidb/util/testleak"
 	"github.com/stretchr/testify/require"
 )
 
 type DDLForTest interface {
-	// SetHook sets the hook.
-	SetHook(h Callback)
 	// SetInterceptor sets the interceptor.
 	SetInterceptor(h Interceptor)
 }
@@ -57,15 +53,6 @@ func (d *ddl) generalWorker() *worker {
 // GetMaxRowID is used for test.
 func GetMaxRowID(store kv.Storage, priority int, t table.Table, startHandle, endHandle kv.Key) (kv.Key, error) {
 	return getRangeEndKey(store, priority, t, startHandle, endHandle)
-}
-
-func TestT(t *testing.T) {
-	CustomVerboseFlag = true
-	*CustomParallelSuiteFlag = true
-
-	testleak.BeforeTest()
-	TestingT(t)
-	testleak.AfterTestT(t)()
 }
 
 func testNewDDLAndStart(ctx context.Context, options ...Option) (*ddl, error) {
@@ -101,17 +88,6 @@ func getSchemaVer(t *testing.T, ctx sessionctx.Context) int64 {
 	return ver
 }
 
-func getSchemaVerT(t *testing.T, ctx sessionctx.Context) int64 {
-	err := ctx.NewTxn(context.Background())
-	require.NoError(t, err)
-	txn, err := ctx.Txn(true)
-	require.NoError(t, err)
-	m := meta.NewMeta(txn)
-	ver, err := m.GetSchemaVersion()
-	require.NoError(t, err)
-	return ver
-}
-
 type historyJobArgs struct {
 	ver    int64
 	db     *model.DBInfo
@@ -127,16 +103,6 @@ func checkEqualTable(t *testing.T, t1, t2 *model.TableInfo) {
 	require.Equal(t, t1.PKIsHandle, t2.PKIsHandle)
 	require.Equal(t, t1.Comment, t2.Comment)
 	require.Equal(t, t1.AutoIncID, t2.AutoIncID)
-}
-
-func checkEqualTableT(t *testing.T, t1, t2 *model.TableInfo) {
-	require.Equal(t, t1.ID, t2.ID)
-	require.Equal(t, t1.Name, t2.Name)
-	require.Equal(t, t1.Charset, t2.Charset)
-	require.Equal(t, t1.Collate, t2.Collate)
-	require.EqualValues(t, t1.PKIsHandle, t2.PKIsHandle)
-	require.EqualValues(t, t1.Comment, t2.Comment)
-	require.EqualValues(t, t1.AutoIncID, t2.AutoIncID)
 }
 
 func checkHistoryJob(t *testing.T, job *model.Job) {
@@ -166,29 +132,6 @@ func checkHistoryJobArgs(t *testing.T, ctx sessionctx.Context, id int64, args *h
 	}
 }
 
-func checkHistoryJobArgsT(t *testing.T, ctx sessionctx.Context, id int64, args *historyJobArgs) {
-	txn, err := ctx.Txn(true)
-	require.NoError(t, err)
-	tt := meta.NewMeta(txn)
-	historyJob, err := tt.GetHistoryDDLJob(id)
-	require.NoError(t, err)
-	require.Greater(t, historyJob.BinlogInfo.FinishedTS, uint64(0))
-
-	if args.tbl != nil {
-		require.Equal(t, args.ver, historyJob.BinlogInfo.SchemaVersion)
-		checkEqualTableT(t, historyJob.BinlogInfo.TableInfo, args.tbl)
-		return
-	}
-
-	// for handling schema job
-	require.Equal(t, args.ver, historyJob.BinlogInfo.SchemaVersion)
-	require.EqualValues(t, args.db, historyJob.BinlogInfo.DBInfo)
-	// only for creating schema job
-	if args.db != nil && len(args.tblIDs) == 0 {
-		return
-	}
-}
-
 func buildCreateIdxJob(dbInfo *model.DBInfo, tblInfo *model.TableInfo, unique bool, indexName string, colName string) *model.Job {
 	return &model.Job{
 		SchemaID:   dbInfo.ID,
@@ -205,6 +148,7 @@ func buildCreateIdxJob(dbInfo *model.DBInfo, tblInfo *model.TableInfo, unique bo
 func testCreatePrimaryKey(t *testing.T, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, colName string) *model.Job {
 	job := buildCreateIdxJob(dbInfo, tblInfo, true, "primary", colName)
 	job.Type = model.ActionAddPrimaryKey
+	ctx.SetValue(sessionctx.QueryString, "skip")
 	err := d.doDDLJob(ctx, job)
 	require.NoError(t, err)
 	v := getSchemaVer(t, ctx)
@@ -214,6 +158,7 @@ func testCreatePrimaryKey(t *testing.T, ctx sessionctx.Context, d *ddl, dbInfo *
 
 func testCreateIndex(t *testing.T, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, unique bool, indexName string, colName string) *model.Job {
 	job := buildCreateIdxJob(dbInfo, tblInfo, unique, indexName, colName)
+	ctx.SetValue(sessionctx.QueryString, "skip")
 	err := d.doDDLJob(ctx, job)
 	require.NoError(t, err)
 	v := getSchemaVer(t, ctx)
@@ -229,6 +174,7 @@ func testAddColumn(t *testing.T, ctx sessionctx.Context, d *ddl, dbInfo *model.D
 		Args:       args,
 		BinlogInfo: &model.HistoryInfo{},
 	}
+	ctx.SetValue(sessionctx.QueryString, "skip")
 	err := d.doDDLJob(ctx, job)
 	require.NoError(t, err)
 	v := getSchemaVer(t, ctx)
@@ -244,6 +190,7 @@ func testAddColumns(t *testing.T, ctx sessionctx.Context, d *ddl, dbInfo *model.
 		Args:       args,
 		BinlogInfo: &model.HistoryInfo{},
 	}
+	ctx.SetValue(sessionctx.QueryString, "skip")
 	err := d.doDDLJob(ctx, job)
 	require.NoError(t, err)
 	v := getSchemaVer(t, ctx)
@@ -267,6 +214,7 @@ func buildDropIdxJob(dbInfo *model.DBInfo, tblInfo *model.TableInfo, indexName s
 
 func testDropIndex(t *testing.T, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, indexName string) *model.Job {
 	job := buildDropIdxJob(dbInfo, tblInfo, indexName)
+	ctx.SetValue(sessionctx.QueryString, "skip")
 	err := d.doDDLJob(ctx, job)
 	require.NoError(t, err)
 	v := getSchemaVer(t, ctx)
