@@ -54,7 +54,7 @@ func TestRequiredRows(t *testing.T) {
 				for i, f := range rfields {
 					defaultInner = append(defaultInner, innerChk.GetRow(0).GetDatum(i, f))
 				}
-				joiner := newJoiner(defaultCtx(), joinType, false, defaultInner, nil, lfields, rfields, nil)
+				joiner := newJoiner(defaultCtx(), joinType, false, defaultInner, nil, lfields, rfields, nil, false)
 
 				fields := make([]*types.FieldType, 0, len(lfields)+len(rfields))
 				fields = append(fields, rfields...)
@@ -81,7 +81,7 @@ func genTestChunk(maxChunkSize int, numRows int, fields []*types.FieldType) *chu
 	for numRows > 0 {
 		numRows--
 		for col, field := range fields {
-			switch field.Tp {
+			switch field.GetType() {
 			case mysql.TypeLong:
 				chk.AppendInt64(col, 0)
 			case mysql.TypeFloat:

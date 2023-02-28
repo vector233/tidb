@@ -18,11 +18,14 @@ import (
 	"bytes"
 	"strconv"
 
-	"github.com/cznic/mathutil"
+	"github.com/pingcap/kvproto/pkg/coprocessor"
+	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/kv"
 	derr "github.com/pingcap/tidb/store/driver/error"
+	"github.com/pingcap/tidb/store/driver/options"
 	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/mathutil"
 	"github.com/tikv/client-go/v2/metrics"
 	"github.com/tikv/client-go/v2/tikv"
 	"go.uber.org/zap"
@@ -39,10 +42,10 @@ func NewRegionCache(rc *tikv.RegionCache) *RegionCache {
 }
 
 // SplitRegionRanges gets the split ranges from pd region.
-func (c *RegionCache) SplitRegionRanges(bo *Backoffer, keyRanges []kv.KeyRange) ([]kv.KeyRange, error) {
+func (c *RegionCache) SplitRegionRanges(bo *Backoffer, keyRanges []kv.KeyRange, limit int) ([]kv.KeyRange, error) {
 	ranges := NewKeyRanges(keyRanges)
 
-	locations, err := c.SplitKeyRangesByLocations(bo, ranges)
+	locations, err := c.SplitKeyRangesByLocations(bo, ranges, limit)
 	if err != nil {
 		return nil, derr.ToTiDBErr(err)
 	}
@@ -77,65 +80,58 @@ func (l *LocationKeyRanges) splitKeyRangesByBuckets() []*LocationKeyRanges {
 	loc := l.Location
 	res := []*LocationKeyRanges{}
 	for ranges.Len() > 0 {
+		// ranges must be in loc.region, so the bucket returned by loc.LocateBucket is guaranteed to be not nil
 		bucket := loc.LocateBucket(ranges.At(0).StartKey)
-		if bucket == nil {
-			// TODO(youjiali1995): if it's overlapped with some buckets, it can be splitted.
-			//
-			// Buckets information may not be up-to-date and accurate.
-			// Find all ranges that can't be located in a bucket and make it one task.
-			i := 1
-			for ; i < ranges.Len(); i++ {
-				if loc.LocateBucket(ranges.At(i).StartKey) != nil {
-					break
-				}
-			}
-			res = append(res, &LocationKeyRanges{l.Location, ranges.Slice(0, i)})
-			ranges = ranges.Slice(i, ranges.Len())
-		} else {
-			// Iterate to the first range that is not complete in the bucket.
-			var r kv.KeyRange
-			var i int
-			for ; i < ranges.Len(); i++ {
-				r = ranges.At(i)
-				if !(bucket.Contains(r.EndKey) || bytes.Equal(bucket.EndKey, r.EndKey)) {
-					break
-				}
-			}
-			// All rest ranges belong to the same bucket.
-			if i == ranges.Len() {
-				res = append(res, &LocationKeyRanges{l.Location, ranges})
+
+		// Iterate to the first range that is not complete in the bucket.
+		var r kv.KeyRange
+		var i int
+		for ; i < ranges.Len(); i++ {
+			r = ranges.At(i)
+			if !(bucket.Contains(r.EndKey) || bytes.Equal(bucket.EndKey, r.EndKey)) {
 				break
 			}
+		}
+		// All rest ranges belong to the same bucket.
+		if i == ranges.Len() {
+			res = append(res, &LocationKeyRanges{l.Location, ranges})
+			break
+		}
 
-			if bucket.Contains(r.StartKey) {
-				// Part of r is not in the bucket. We need to split it.
-				taskRanges := ranges.Slice(0, i)
-				taskRanges.last = &kv.KeyRange{
-					StartKey: r.StartKey,
-					EndKey:   bucket.EndKey,
-				}
-				res = append(res, &LocationKeyRanges{l.Location, taskRanges})
-
-				ranges = ranges.Slice(i+1, ranges.Len())
-				ranges.first = &kv.KeyRange{
-					StartKey: bucket.EndKey,
-					EndKey:   r.EndKey,
-				}
-			} else {
-				// ranges[i] is not in the bucket.
-				taskRanges := ranges.Slice(0, i)
-				res = append(res, &LocationKeyRanges{l.Location, taskRanges})
-				ranges = ranges.Slice(i, ranges.Len())
+		if bucket.Contains(r.StartKey) {
+			// Part of r is not in the bucket. We need to split it.
+			taskRanges := ranges.Slice(0, i)
+			taskRanges.last = &kv.KeyRange{
+				StartKey: r.StartKey,
+				EndKey:   bucket.EndKey,
 			}
+			res = append(res, &LocationKeyRanges{l.Location, taskRanges})
+
+			ranges = ranges.Slice(i+1, ranges.Len())
+			ranges.first = &kv.KeyRange{
+				StartKey: bucket.EndKey,
+				EndKey:   r.EndKey,
+			}
+		} else {
+			// ranges[i] is not in the bucket.
+			taskRanges := ranges.Slice(0, i)
+			res = append(res, &LocationKeyRanges{l.Location, taskRanges})
+			ranges = ranges.Slice(i, ranges.Len())
 		}
 	}
 	return res
 }
 
+// UnspecifiedLimit means no limit.
+const UnspecifiedLimit = -1
+
 // SplitKeyRangesByLocations splits the KeyRanges by logical info in the cache.
-func (c *RegionCache) SplitKeyRangesByLocations(bo *Backoffer, ranges *KeyRanges) ([]*LocationKeyRanges, error) {
+func (c *RegionCache) SplitKeyRangesByLocations(bo *Backoffer, ranges *KeyRanges, limit int) ([]*LocationKeyRanges, error) {
 	res := make([]*LocationKeyRanges, 0)
 	for ranges.Len() > 0 {
+		if limit != UnspecifiedLimit && len(res) >= limit {
+			break
+		}
 		loc, err := c.LocateKey(bo.TiKVBackoffer(), ranges.At(0).StartKey)
 		if err != nil {
 			return res, derr.ToTiDBErr(err)
@@ -186,7 +182,7 @@ func (c *RegionCache) SplitKeyRangesByLocations(bo *Backoffer, ranges *KeyRanges
 //
 // TODO(youjiali1995): Try to do it in one round and reduce allocations if bucket is not enabled.
 func (c *RegionCache) SplitKeyRangesByBuckets(bo *Backoffer, ranges *KeyRanges) ([]*LocationKeyRanges, error) {
-	locs, err := c.SplitKeyRangesByLocations(bo, ranges)
+	locs, err := c.SplitKeyRangesByLocations(bo, ranges, UnspecifiedLimit)
 	if err != nil {
 		return nil, derr.ToTiDBErr(err)
 	}
@@ -211,4 +207,29 @@ func (c *RegionCache) OnSendFailForBatchRegions(bo *Backoffer, store *tikv.Store
 		}
 		c.OnSendFailForTiFlash(bo.TiKVBackoffer(), store, ri.Region, ri.Meta, scheduleReload, err, !(index < 10 || log.GetLevel() <= zap.DebugLevel))
 	}
+}
+
+// BuildBatchTask fetches store and peer info for cop task, wrap it as `batchedCopTask`.
+func (c *RegionCache) BuildBatchTask(bo *Backoffer, task *copTask, replicaRead kv.ReplicaReadType) (*batchedCopTask, error) {
+	rpcContext, err := c.GetTiKVRPCContext(bo.TiKVBackoffer(), task.region, options.GetTiKVReplicaReadType(replicaRead), 0)
+	if err != nil {
+		return nil, err
+	}
+	// fallback to non-batch path
+	if rpcContext == nil {
+		return nil, nil
+	}
+	return &batchedCopTask{
+		task: task,
+		region: coprocessor.RegionInfo{
+			RegionId: rpcContext.Region.GetID(),
+			RegionEpoch: &metapb.RegionEpoch{
+				ConfVer: rpcContext.Region.GetConfVer(),
+				Version: rpcContext.Region.GetVer(),
+			},
+			Ranges: task.ranges.ToPBRanges(),
+		},
+		storeID: rpcContext.Store.StoreID(),
+		peer:    rpcContext.Peer,
+	}, nil
 }

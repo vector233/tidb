@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/parser/model"
 	"github.com/pingcap/tidb/parser/terror"
@@ -39,7 +40,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func parseLog(retriever *slowQueryRetriever, sctx sessionctx.Context, reader *bufio.Reader, logNum int) ([][]types.Datum, error) {
+func parseLog(retriever *slowQueryRetriever, sctx sessionctx.Context, reader *bufio.Reader) ([][]types.Datum, error) {
 	retriever.taskList = make(chan slowLogTask, 100)
 	ctx := context.Background()
 	retriever.parseSlowLog(ctx, sctx, reader, 64)
@@ -67,14 +68,14 @@ func newSlowQueryRetriever() (*slowQueryRetriever, error) {
 	return &slowQueryRetriever{outputCols: tbl.Meta().Columns}, nil
 }
 
-func parseSlowLog(sctx sessionctx.Context, reader *bufio.Reader, logNum int) ([][]types.Datum, error) {
+func parseSlowLog(sctx sessionctx.Context, reader *bufio.Reader) ([][]types.Datum, error) {
 	retriever, err := newSlowQueryRetriever()
 	if err != nil {
 		return nil, err
 	}
 	// Ignore the error is ok for test.
 	terror.Log(retriever.initialize(context.Background(), sctx))
-	rows, err := parseLog(retriever, sctx, reader, logNum)
+	rows, err := parseLog(retriever, sctx, reader)
 	return rows, err
 }
 
@@ -108,7 +109,7 @@ select * from t;`
 	require.NoError(t, err)
 	sctx := mock.NewContext()
 	sctx.GetSessionVars().TimeZone = loc
-	_, err = parseSlowLog(sctx, reader, 64)
+	_, err = parseSlowLog(sctx, reader)
 	require.Error(t, err)
 	require.Equal(t, err.Error(), "panic test")
 }
@@ -145,7 +146,7 @@ select * from t;`
 	require.NoError(t, err)
 	ctx := mock.NewContext()
 	ctx.GetSessionVars().TimeZone = loc
-	rows, err := parseSlowLog(ctx, reader, 64)
+	rows, err := parseSlowLog(ctx, reader)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	recordString := ""
@@ -160,15 +161,15 @@ select * from t;`
 	expectRecordString := `2019-04-28 15:24:04.309074,` +
 		`405888132465033227,root,localhost,0,57,0.12,0.216905,` +
 		`0,0,0,0,0,0,0,0,0,0,0,0,,0,0,0,0,0,0,0.38,0.021,0,0,0,1,637,0,10,10,10,10,100,,,1,42a1c8aae6f133e934d4bf0147491709a8812ea05ff8819ec522780fe657b772,t1:1,t2:2,` +
-		`0.1,0.2,0.03,127.0.0.1:20160,0.05,0.6,0.8,0.0.0.0:20160,70724,65536,0,0,0,0,0,` +
+		`0.1,0.2,0.03,127.0.0.1:20160,0.05,0.6,0.8,0.0.0.0:20160,70724,65536,0,0,0,0,0,,` +
 		`Cop_backoff_regionMiss_total_times: 200 Cop_backoff_regionMiss_total_time: 0.2 Cop_backoff_regionMiss_max_time: 0.2 Cop_backoff_regionMiss_max_addr: 127.0.0.1 Cop_backoff_regionMiss_avg_time: 0.2 Cop_backoff_regionMiss_p90_time: 0.2 Cop_backoff_rpcPD_total_times: 200 Cop_backoff_rpcPD_total_time: 0.2 Cop_backoff_rpcPD_max_time: 0.2 Cop_backoff_rpcPD_max_addr: 127.0.0.1 Cop_backoff_rpcPD_avg_time: 0.2 Cop_backoff_rpcPD_p90_time: 0.2 Cop_backoff_rpcTiKV_total_times: 200 Cop_backoff_rpcTiKV_total_time: 0.2 Cop_backoff_rpcTiKV_max_time: 0.2 Cop_backoff_rpcTiKV_max_addr: 127.0.0.1 Cop_backoff_rpcTiKV_avg_time: 0.2 Cop_backoff_rpcTiKV_p90_time: 0.2,` +
-		`0,0,1,0,1,1,,60e9378c746d9a2be1c791047e008967cf252eb6de9167ad3aa6098fa2d523f4,` +
-		`update t set i = 1;,select * from t;`
+		`0,0,1,0,1,1,0,,60e9378c746d9a2be1c791047e008967cf252eb6de9167ad3aa6098fa2d523f4,` +
+		`,update t set i = 1;,select * from t;`
 	require.Equal(t, expectRecordString, recordString)
 
 	// Issue 20928
 	reader = bufio.NewReader(bytes.NewBufferString(slowLogStr))
-	rows, err = parseSlowLog(ctx, reader, 1)
+	rows, err = parseSlowLog(ctx, reader)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	recordString = ""
@@ -183,10 +184,10 @@ select * from t;`
 	expectRecordString = `2019-04-28 15:24:04.309074,` +
 		`405888132465033227,root,localhost,0,57,0.12,0.216905,` +
 		`0,0,0,0,0,0,0,0,0,0,0,0,,0,0,0,0,0,0,0.38,0.021,0,0,0,1,637,0,10,10,10,10,100,,,1,42a1c8aae6f133e934d4bf0147491709a8812ea05ff8819ec522780fe657b772,t1:1,t2:2,` +
-		`0.1,0.2,0.03,127.0.0.1:20160,0.05,0.6,0.8,0.0.0.0:20160,70724,65536,0,0,0,0,0,` +
+		`0.1,0.2,0.03,127.0.0.1:20160,0.05,0.6,0.8,0.0.0.0:20160,70724,65536,0,0,0,0,0,,` +
 		`Cop_backoff_regionMiss_total_times: 200 Cop_backoff_regionMiss_total_time: 0.2 Cop_backoff_regionMiss_max_time: 0.2 Cop_backoff_regionMiss_max_addr: 127.0.0.1 Cop_backoff_regionMiss_avg_time: 0.2 Cop_backoff_regionMiss_p90_time: 0.2 Cop_backoff_rpcPD_total_times: 200 Cop_backoff_rpcPD_total_time: 0.2 Cop_backoff_rpcPD_max_time: 0.2 Cop_backoff_rpcPD_max_addr: 127.0.0.1 Cop_backoff_rpcPD_avg_time: 0.2 Cop_backoff_rpcPD_p90_time: 0.2 Cop_backoff_rpcTiKV_total_times: 200 Cop_backoff_rpcTiKV_total_time: 0.2 Cop_backoff_rpcTiKV_max_time: 0.2 Cop_backoff_rpcTiKV_max_addr: 127.0.0.1 Cop_backoff_rpcTiKV_avg_time: 0.2 Cop_backoff_rpcTiKV_p90_time: 0.2,` +
-		`0,0,1,0,1,1,,60e9378c746d9a2be1c791047e008967cf252eb6de9167ad3aa6098fa2d523f4,` +
-		`update t set i = 1;,select * from t;`
+		`0,0,1,0,1,1,0,,60e9378c746d9a2be1c791047e008967cf252eb6de9167ad3aa6098fa2d523f4,` +
+		`,update t set i = 1;,select * from t;`
 	require.Equal(t, expectRecordString, recordString)
 
 	// fix sql contain '# ' bug
@@ -204,7 +205,7 @@ select a# from t;
 select * from t;
 `)
 	reader = bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, reader, 64)
+	_, err = parseSlowLog(ctx, reader)
 	require.NoError(t, err)
 
 	// test for time format compatibility.
@@ -215,7 +216,7 @@ select * from t;
 select * from t;
 `)
 	reader = bufio.NewReader(slowLog)
-	rows, err = parseSlowLog(ctx, reader, 64)
+	rows, err = parseSlowLog(ctx, reader)
 	require.NoError(t, err)
 	require.Len(t, rows, 2)
 	t0Str, err := rows[0][0].ToString()
@@ -232,7 +233,7 @@ select * from t;
 select * from t;
 `)
 	reader = bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, reader, 64)
+	_, err = parseSlowLog(ctx, reader)
 	require.NoError(t, err)
 	warnings := ctx.GetSessionVars().StmtCtx.GetWarnings()
 	require.Len(t, warnings, 1)
@@ -256,13 +257,13 @@ select * from t;
 	sql := strings.Repeat("x", int(variable.MaxOfMaxAllowedPacket+1))
 	slowLog.WriteString(sql)
 	reader := bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, reader, 64)
+	_, err = parseSlowLog(ctx, reader)
 	require.Error(t, err)
 	require.EqualError(t, err, "single line length exceeds limit: 65536")
 
 	variable.MaxOfMaxAllowedPacket = originValue
 	reader = bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, reader, 64)
+	_, err = parseSlowLog(ctx, reader)
 	require.NoError(t, err)
 }
 
@@ -313,7 +314,7 @@ select * from t;`)
 	require.NoError(t, err)
 	ctx := mock.NewContext()
 	ctx.GetSessionVars().TimeZone = loc
-	_, err = parseSlowLog(ctx, scanner, 64)
+	_, err = parseSlowLog(ctx, scanner)
 	require.NoError(t, err)
 
 	// Test parser error.
@@ -323,7 +324,7 @@ select * from t;`)
 select * from t;
 `)
 	scanner = bufio.NewReader(slowLog)
-	_, err = parseSlowLog(ctx, scanner, 64)
+	_, err = parseSlowLog(ctx, scanner)
 	require.NoError(t, err)
 	warnings := ctx.GetSessionVars().StmtCtx.GetWarnings()
 	require.Len(t, warnings, 1)
@@ -351,10 +352,14 @@ select 6;
 select 7;`
 	logData := []string{logData0, logData1, logData2, logData3}
 
-	fileName0 := "tidb-slow-2020-02-14T19-04-05.01.log"
-	fileName1 := "tidb-slow-2020-02-15T19-04-05.01.log"
-	fileName2 := "tidb-slow-2020-02-16T19-04-05.01.log"
-	fileName3 := "tidb-slow.log"
+	fileName0 := "tidb-slow-retriever-2020-02-14T19-04-05.01.log"
+	fileName1 := "tidb-slow-retriever-2020-02-15T19-04-05.01.log"
+	fileName2 := "tidb-slow-retriever-2020-02-16T19-04-05.01.log"
+	fileName3 := "tidb-slow-retriever.log"
+	defer config.RestoreFunc()()
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.Log.SlowQueryFile = fileName3
+	})
 	fileNames := []string{fileName0, fileName1, fileName2, fileName3}
 	prepareLogs(t, logData, fileNames)
 	defer func() {
@@ -469,7 +474,7 @@ select 7;`
 		require.Equal(t, len(retriever.files), len(cas.files), comment)
 		if len(retriever.files) > 0 {
 			reader := bufio.NewReader(retriever.files[0].file)
-			rows, err := parseLog(retriever, sctx, reader, 64)
+			rows, err := parseLog(retriever, sctx, reader)
 			require.NoError(t, err)
 			require.Equal(t, len(rows), len(cas.querys), comment)
 			for i, row := range rows {
@@ -554,11 +559,15 @@ select 7;
 select 9;`
 	logData := []string{logData0, logData1, logData2, logData3, logData4}
 
-	fileName0 := "tidb-slow-2020-02-14T19-04-05.01.log"
-	fileName1 := "tidb-slow-2020-02-15T19-04-05.01.log"
-	fileName2 := "tidb-slow-2020-02-16T19-04-05.01.log"
-	fileName3 := "tidb-slow-2020-02-17T19-04-05.01.log"
-	fileName4 := "tidb-slow.log"
+	fileName0 := "tidb-slow-reverse-scan-2020-02-14T19-04-05.01.log"
+	fileName1 := "tidb-slow-reverse-scan-2020-02-15T19-04-05.01.log"
+	fileName2 := "tidb-slow-reverse-scan-2020-02-16T19-04-05.01.log"
+	fileName3 := "tidb-slow-reverse-scan-2020-02-17T19-04-05.01.log"
+	fileName4 := "tidb-slow-reverse-scan.log"
+	defer config.RestoreFunc()()
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.Log.SlowQueryFile = fileName4
+	})
 	fileNames := []string{fileName0, fileName1, fileName2, fileName3, fileName4}
 	prepareLogs(t, logData, fileNames)
 	defer func() {
@@ -666,7 +675,7 @@ select * from t;`
 	retriever, err := newSlowQueryRetriever()
 	require.NoError(t, err)
 	var signal1, signal2 = make(chan int, 1), make(chan int, 1)
-	ctx := context.WithValue(context.Background(), "signals", []chan int{signal1, signal2})
+	ctx := context.WithValue(context.Background(), signalsKey{}, []chan int{signal1, signal2})
 	ctx, cancel := context.WithCancel(ctx)
 	err = failpoint.Enable("github.com/pingcap/tidb/executor/mockReadSlowLogSlow", "return(true)")
 	require.NoError(t, err)

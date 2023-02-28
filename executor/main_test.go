@@ -23,7 +23,7 @@ import (
 	"github.com/pingcap/tidb/testkit"
 	"github.com/pingcap/tidb/testkit/testdata"
 	"github.com/pingcap/tidb/testkit/testmain"
-	"github.com/pingcap/tidb/util/testbridge"
+	"github.com/pingcap/tidb/testkit/testsetup"
 	"github.com/tikv/client-go/v2/tikv"
 	"go.uber.org/goleak"
 )
@@ -33,34 +33,37 @@ var prepareMergeSuiteData testdata.TestData
 var aggMergeSuiteData testdata.TestData
 var executorSuiteData testdata.TestData
 var pointGetSuiteData testdata.TestData
+var slowQuerySuiteData testdata.TestData
 
 func TestMain(m *testing.M) {
-	testbridge.SetupForCommonTest()
+	testsetup.SetupForCommonTest()
 	testDataMap.LoadTestSuiteData("testdata", "agg_suite")
 	testDataMap.LoadTestSuiteData("testdata", "executor_suite")
 	testDataMap.LoadTestSuiteData("testdata", "prepare_suite")
 	testDataMap.LoadTestSuiteData("testdata", "point_get_suite")
+	testDataMap.LoadTestSuiteData("testdata", "slow_query_suite")
 	aggMergeSuiteData = testDataMap["agg_suite"]
 	executorSuiteData = testDataMap["executor_suite"]
 	prepareMergeSuiteData = testDataMap["prepare_suite"]
 	pointGetSuiteData = testDataMap["point_get_suite"]
+	slowQuerySuiteData = testDataMap["slow_query_suite"]
 
 	autoid.SetStep(5000)
 	config.UpdateGlobal(func(conf *config.Config) {
-		conf.Log.SlowThreshold = 30000 // 30s
+		conf.Instance.SlowThreshold = 30000 // 30s
 		conf.TiKVClient.AsyncCommit.SafeWindow = 0
 		conf.TiKVClient.AsyncCommit.AllowedClockDrift = 0
 		conf.Experimental.AllowsExpressionIndex = true
-		conf.OOMAction = config.OOMActionLog
 	})
 	tikv.EnableFailpoints()
 
 	opts := []goleak.Option{
 		goleak.IgnoreTopFunction("github.com/golang/glog.(*loggingT).flushDaemon"),
+		goleak.IgnoreTopFunction("github.com/lestrrat-go/httprc.runFetchWorker"),
 		goleak.IgnoreTopFunction("go.etcd.io/etcd/client/pkg/v3/logutil.(*MergeLogger).outputLoop"),
-		goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"),
 		goleak.IgnoreTopFunction("gopkg.in/natefinch/lumberjack%2ev2.(*Logger).millRun"),
 		goleak.IgnoreTopFunction("github.com/tikv/client-go/v2/txnkv/transaction.keepAlive"),
+		goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"),
 	}
 	callback := func(i int) int {
 		testDataMap.GenerateOutputIfNeeded()

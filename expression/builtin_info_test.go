@@ -24,7 +24,6 @@ import (
 	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/testkit/testutil"
 	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/printer"
@@ -164,7 +163,7 @@ func TestBenchMark(t *testing.T) {
 		{3, types.CurrentTime(mysql.TypeDatetime), 0, false},
 		{3, types.CurrentTime(mysql.TypeTimestamp), 0, false},
 		{3, types.CurrentTime(mysql.TypeDuration), 0, false},
-		{3, json.CreateBinary("[1]"), 0, false},
+		{3, types.CreateBinaryJSON("[1]"), 0, false},
 	}
 
 	for _, c := range cases {
@@ -194,7 +193,7 @@ func TestCharset(t *testing.T) {
 	f, err := fc.getFunction(ctx, datumsToConstants(types.MakeDatums(nil)))
 	require.NotNil(t, f)
 	require.NoError(t, err)
-	require.Equal(t, 64, f.getRetTp().Flen)
+	require.Equal(t, 64, f.getRetTp().GetFlen())
 }
 
 func TestCoercibility(t *testing.T) {
@@ -211,7 +210,7 @@ func TestCollation(t *testing.T) {
 	f, err := fc.getFunction(ctx, datumsToConstants(types.MakeDatums(nil)))
 	require.NotNil(t, f)
 	require.NoError(t, err)
-	require.Equal(t, 64, f.getRetTp().Flen)
+	require.Equal(t, 64, f.getRetTp().GetFlen())
 }
 
 func TestRowCount(t *testing.T) {
@@ -276,11 +275,11 @@ func TestLastInsertID(t *testing.T) {
 		}
 		tp := f.GetType()
 		require.NoError(t, err)
-		require.Equal(t, mysql.TypeLonglong, tp.Tp)
-		require.Equal(t, charset.CharsetBin, tp.Charset)
-		require.Equal(t, charset.CollationBin, tp.Collate)
-		require.Equal(t, mysql.BinaryFlag, tp.Flag&mysql.BinaryFlag)
-		require.Equal(t, mysql.MaxIntWidth, tp.Flen)
+		require.Equal(t, mysql.TypeLonglong, tp.GetType())
+		require.Equal(t, charset.CharsetBin, tp.GetCharset())
+		require.Equal(t, charset.CollationBin, tp.GetCollate())
+		require.Equal(t, mysql.BinaryFlag, tp.GetFlag()&mysql.BinaryFlag)
+		require.Equal(t, mysql.MaxIntWidth, tp.GetFlen())
 		d, err := f.Eval(chunk.Row{})
 		if c.getErr {
 			require.Error(t, err)

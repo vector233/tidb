@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cznic/mathutil"
+	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/expression/aggregation"
 	"github.com/pingcap/tidb/parser/ast"
@@ -32,13 +32,12 @@ import (
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/disk"
+	"github.com/pingcap/tidb/util/mathutil"
 	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/stretchr/testify/require"
-	"github.com/tikv/client-go/v2/oracle"
 )
 
 type requiredRowsDataSource struct {
@@ -107,7 +106,7 @@ func (r *requiredRowsDataSource) genOneRow() chunk.Row {
 }
 
 func defaultGenerator(valType *types.FieldType) interface{} {
-	switch valType.Tp {
+	switch valType.GetType() {
 	case mysql.TypeLong, mysql.TypeLonglong:
 		return int64(rand.Int())
 	case mysql.TypeDouble:
@@ -213,6 +212,7 @@ func defaultCtx() sessionctx.Context {
 	ctx.GetSessionVars().StmtCtx.MemTracker = memory.NewTracker(-1, ctx.GetSessionVars().MemQuotaQuery)
 	ctx.GetSessionVars().StmtCtx.DiskTracker = disk.NewTracker(-1, -1)
 	ctx.GetSessionVars().SnapshotTS = uint64(1)
+	domain.BindDomain(ctx, domain.NewMockDomain())
 	return ctx
 }
 
@@ -400,7 +400,7 @@ func TestSelectionRequiredRows(t *testing.T) {
 	gen01 := func() func(valType *types.FieldType) interface{} {
 		closureCount := 0
 		return func(valType *types.FieldType) interface{} {
-			switch valType.Tp {
+			switch valType.GetType() {
 			case mysql.TypeLong, mysql.TypeLonglong:
 				ret := int64(closureCount % 2)
 				closureCount++
@@ -607,7 +607,7 @@ func divGenerator(factor int) func(valType *types.FieldType) interface{} {
 	closureCountInt := 0
 	closureCountDouble := 0
 	return func(valType *types.FieldType) interface{} {
-		switch valType.Tp {
+		switch valType.GetType() {
 		case mysql.TypeLong, mysql.TypeLonglong:
 			ret := int64(closureCountInt / factor)
 			closureCountInt++
@@ -683,7 +683,7 @@ func TestStreamAggRequiredRows(t *testing.T) {
 
 func TestMergeJoinRequiredRows(t *testing.T) {
 	justReturn1 := func(valType *types.FieldType) interface{} {
-		switch valType.Tp {
+		switch valType.GetType() {
 		case mysql.TypeLong, mysql.TypeLonglong:
 			return int64(1)
 		case mysql.TypeDouble:
@@ -757,7 +757,7 @@ func genTestChunk4VecGroupChecker(chkRows []int, sameNum int) (expr []expression
 
 	expr = make([]expression.Expression, 1)
 	expr[0] = &expression.Column{
-		RetType: &types.FieldType{Tp: mysql.TypeLonglong, Flen: mysql.MaxIntWidth},
+		RetType: types.NewFieldTypeBuilder().SetType(mysql.TypeLonglong).SetFlen(mysql.MaxIntWidth).BuildP(),
 		Index:   0,
 	}
 	return
@@ -846,7 +846,7 @@ func buildMergeJoinExec(ctx sessionctx.Context, joinType plannercore.JoinType, i
 		j.CompareFuncs = append(j.CompareFuncs, expression.GetCmpFunction(nil, j.LeftJoinKeys[i], j.RightJoinKeys[i]))
 	}
 
-	b := newExecutorBuilder(ctx, nil, nil, 0, false, oracle.GlobalTxnScope)
+	b := newExecutorBuilder(ctx, nil, nil)
 	return b.build(j)
 }
 
@@ -863,6 +863,11 @@ func (mp *mockPlan) Schema() *expression.Schema {
 	return mp.exec.Schema()
 }
 
+// MemoryUsage of mockPlan is only for testing
+func (mp *mockPlan) MemoryUsage() (sum int64) {
+	return
+}
+
 func TestVecGroupCheckerDATARACE(t *testing.T) {
 	ctx := mock.NewContext()
 
@@ -870,7 +875,7 @@ func TestVecGroupCheckerDATARACE(t *testing.T) {
 	for _, mType := range mTypes {
 		exprs := make([]expression.Expression, 1)
 		exprs[0] = &expression.Column{
-			RetType: &types.FieldType{Tp: mType},
+			RetType: types.NewFieldTypeBuilder().SetType(mType).BuildP(),
 			Index:   0,
 		}
 		vgc := newVecGroupChecker(ctx, exprs)
@@ -891,7 +896,7 @@ func TestVecGroupCheckerDATARACE(t *testing.T) {
 			chk.Column(0).Decimals()[0] = *types.NewDecFromInt(123)
 		case mysql.TypeJSON:
 			chk.Column(0).ReserveJSON(1)
-			j := new(json.BinaryJSON)
+			j := new(types.BinaryJSON)
 			require.NoError(t, j.UnmarshalJSON([]byte(fmt.Sprintf(`{"%v":%v}`, 123, 123))))
 			chk.Column(0).AppendJSON(*j)
 		}
@@ -918,7 +923,7 @@ func TestVecGroupCheckerDATARACE(t *testing.T) {
 			require.Equal(t, `{"123": 123}`, vgc.firstRowDatums[0].GetMysqlJSON().String())
 			require.Equal(t, `{"123": 123}`, vgc.lastRowDatums[0].GetMysqlJSON().String())
 			chk.Column(0).ReserveJSON(1)
-			j := new(json.BinaryJSON)
+			j := new(types.BinaryJSON)
 			require.NoError(t, j.UnmarshalJSON([]byte(fmt.Sprintf(`{"%v":%v}`, 456, 456))))
 			chk.Column(0).AppendJSON(*j)
 			require.Equal(t, `{"123": 123}`, vgc.firstRowDatums[0].GetMysqlJSON().String())

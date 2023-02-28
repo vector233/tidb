@@ -15,6 +15,8 @@
 package expression
 
 import (
+	goatomic "sync/atomic"
+
 	"github.com/pingcap/tidb/parser/ast"
 	"github.com/pingcap/tidb/parser/charset"
 	"github.com/pingcap/tidb/parser/mysql"
@@ -24,6 +26,7 @@ import (
 	"github.com/pingcap/tidb/util/collate"
 	"github.com/pingcap/tidb/util/hack"
 	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/atomic"
 )
 
 // ExprCollation is a struct that store the collation related information.
@@ -36,7 +39,7 @@ type ExprCollation struct {
 
 type collationInfo struct {
 	coer       Coercibility
-	coerInit   bool
+	coerInit   atomic.Bool
 	repertoire Repertoire
 
 	charset   string
@@ -44,17 +47,17 @@ type collationInfo struct {
 }
 
 func (c *collationInfo) HasCoercibility() bool {
-	return c.coerInit
+	return c.coerInit.Load()
 }
 
 func (c *collationInfo) Coercibility() Coercibility {
-	return c.coer
+	return Coercibility(goatomic.LoadInt32((*int32)(&c.coer)))
 }
 
 // SetCoercibility implements CollationInfo SetCoercibility interface.
 func (c *collationInfo) SetCoercibility(val Coercibility) {
-	c.coer = val
-	c.coerInit = true
+	goatomic.StoreInt32((*int32)(&c.coer), int32(val))
+	c.coerInit.Store(true)
 }
 
 func (c *collationInfo) Repertoire() Repertoire {
@@ -99,7 +102,7 @@ type CollationInfo interface {
 
 // Coercibility values are used to check whether the collation of one item can be coerced to
 // the collation of other. See https://dev.mysql.com/doc/refman/8.0/en/charset-collation-coercibility.html
-type Coercibility int
+type Coercibility int32
 
 const (
 	// CoercibilityExplicit is derived from an explicit COLLATE clause.
@@ -157,7 +160,7 @@ const (
 	UNICODE = ASCII | EXTENDED
 )
 
-func deriveCoercibilityForScarlarFunc(sf *ScalarFunction) Coercibility {
+func deriveCoercibilityForScalarFunc(sf *ScalarFunction) Coercibility {
 	panic("this function should never be called")
 }
 
@@ -172,7 +175,7 @@ func deriveCoercibilityForConstant(c *Constant) Coercibility {
 
 func deriveCoercibilityForColumn(c *Column) Coercibility {
 	// For specified type null, it should return CoercibilityIgnorable, which means it got the lowest priority in DeriveCollationFromExprs.
-	if c.RetType.Tp == mysql.TypeNull {
+	if c.RetType.GetType() == mysql.TypeNull {
 		return CoercibilityIgnorable
 	}
 
@@ -204,7 +207,9 @@ func deriveCollation(ctx sessionctx.Context, funcName string, args []Expression,
 		if argTps[0] == types.ETString {
 			return CheckAndDeriveCollationFromExprs(ctx, funcName, retType, args...)
 		}
-	case ast.Locate, ast.Instr, ast.Position:
+	case ast.RegexpReplace:
+		return CheckAndDeriveCollationFromExprs(ctx, funcName, retType, args[0], args[1], args[2])
+	case ast.Locate, ast.Instr, ast.Position, ast.RegexpLike, ast.RegexpSubstr, ast.RegexpInStr:
 		return CheckAndDeriveCollationFromExprs(ctx, funcName, retType, args[0], args[1])
 	case ast.GE, ast.LE, ast.GT, ast.LT, ast.EQ, ast.NE, ast.NullEQ, ast.Strcmp:
 		// if compare type is string, we should determine which collation should be used.
@@ -238,7 +243,7 @@ func deriveCollation(ctx sessionctx.Context, funcName string, args []Expression,
 		return &ExprCollation{args[1].Coercibility(), args[1].Repertoire(), charsetInfo, collation}, nil
 	case ast.Cast:
 		// We assume all the cast are implicit.
-		ec = &ExprCollation{args[0].Coercibility(), args[0].Repertoire(), args[0].GetType().Charset, args[0].GetType().Collate}
+		ec = &ExprCollation{args[0].Coercibility(), args[0].Repertoire(), args[0].GetType().GetCharset(), args[0].GetType().GetCollate()}
 		// Non-string type cast to string type should use @@character_set_connection and @@collation_connection.
 		// String type cast to string type should keep its original charset and collation. It should not happen.
 		if retType == types.ETString && argTps[0] != types.ETString {
@@ -272,10 +277,14 @@ func deriveCollation(ctx sessionctx.Context, funcName string, args []Expression,
 	case ast.Database, ast.User, ast.CurrentUser, ast.Version, ast.CurrentRole, ast.TiDBVersion:
 		chs, coll := charset.GetDefaultCharsetAndCollate()
 		return &ExprCollation{CoercibilitySysconst, UNICODE, chs, coll}, nil
-	case ast.Format, ast.Space, ast.ToBase64, ast.UUID, ast.Hex, ast.MD5, ast.SHA, ast.SHA2:
+	case ast.Format, ast.Space, ast.ToBase64, ast.UUID, ast.Hex, ast.MD5, ast.SHA, ast.SHA2, ast.SM3:
 		// should return ASCII repertoire, MySQL's doc says it depends on character_set_connection, but it not true from its source code.
 		ec = &ExprCollation{Coer: CoercibilityCoercible, Repe: ASCII}
 		ec.Charset, ec.Collation = ctx.GetSessionVars().GetCharsetInfo()
+		return ec, nil
+	case ast.JSONPretty, ast.JSONQuote:
+		// JSON function always return utf8mb4 and utf8mb4_bin.
+		ec = &ExprCollation{Coer: CoercibilityCoercible, Repe: UNICODE, Charset: charset.CharsetUTF8MB4, Collation: charset.CollationUTF8MB4}
 		return ec, nil
 	}
 
@@ -288,14 +297,6 @@ func deriveCollation(ctx sessionctx.Context, funcName string, args []Expression,
 		}
 	}
 	return ec, nil
-}
-
-// DeriveCollationFromExprs derives collation information from these expressions.
-// Deprecated, use CheckAndDeriveCollationFromExprs instead.
-// TODO: remove this function after the all usage is replaced by CheckAndDeriveCollationFromExprs
-func DeriveCollationFromExprs(ctx sessionctx.Context, exprs ...Expression) (dstCharset, dstCollation string) {
-	collation := inferCollation(exprs...)
-	return collation.Charset, collation.Collation
 }
 
 // CheckAndDeriveCollationFromExprs derives collation information from these expressions, return error if derives collation error.
@@ -325,7 +326,7 @@ func CheckAndDeriveCollationFromExprs(ctx sessionctx.Context, funcName string, e
 func safeConvert(ctx sessionctx.Context, ec *ExprCollation, args ...Expression) bool {
 	enc := charset.FindEncodingTakeUTF8AsNoop(ec.Charset)
 	for _, arg := range args {
-		if arg.GetType().Charset == ec.Charset {
+		if arg.GetType().GetCharset() == ec.Charset {
 			continue
 		}
 
@@ -346,7 +347,7 @@ func safeConvert(ctx sessionctx.Context, ec *ExprCollation, args ...Expression) 
 				return false
 			}
 		} else {
-			if arg.GetType().Collate != charset.CharsetBin && ec.Charset != charset.CharsetBin && !isUnicodeCollation(ec.Charset) {
+			if arg.GetType().GetCollate() != charset.CharsetBin && ec.Charset != charset.CharsetBin && !isUnicodeCollation(ec.Charset) {
 				return false
 			}
 		}
@@ -370,7 +371,7 @@ func inferCollation(exprs ...Expression) *ExprCollation {
 
 	repertoire := exprs[0].Repertoire()
 	coercibility := exprs[0].Coercibility()
-	dstCharset, dstCollation := exprs[0].GetType().Charset, exprs[0].GetType().Collate
+	dstCharset, dstCollation := exprs[0].GetType().GetCharset(), exprs[0].GetType().GetCollate()
 	if exprs[0].GetType().EvalType() == types.ETJson {
 		dstCharset, dstCollation = charset.CharsetUTF8MB4, charset.CollationUTF8MB4
 	}
@@ -378,7 +379,7 @@ func inferCollation(exprs ...Expression) *ExprCollation {
 
 	// Aggregate arguments one by one, agg(a, b, c) := agg(agg(a, b), c).
 	for _, arg := range exprs[1:] {
-		argCharset, argCollation := arg.GetType().Charset, arg.GetType().Collate
+		argCharset, argCollation := arg.GetType().GetCharset(), arg.GetType().GetCollate()
 		// The collation of JSON is always utf8mb4_bin in builtin-func which is same as MySQL
 		// see details https://github.com/pingcap/tidb/issues/31320#issuecomment-1010599311
 		if arg.GetType().EvalType() == types.ETJson {
@@ -504,9 +505,9 @@ func illegalMixCollationErr(funcName string, args []Expression) error {
 
 	switch len(args) {
 	case 2:
-		return collate.ErrIllegalMix2Collation.GenWithStackByArgs(args[0].GetType().Collate, coerString[args[0].Coercibility()], args[1].GetType().Collate, coerString[args[1].Coercibility()], funcName)
+		return collate.ErrIllegalMix2Collation.GenWithStackByArgs(args[0].GetType().GetCollate(), coerString[args[0].Coercibility()], args[1].GetType().GetCollate(), coerString[args[1].Coercibility()], funcName)
 	case 3:
-		return collate.ErrIllegalMix3Collation.GenWithStackByArgs(args[0].GetType().Collate, coerString[args[0].Coercibility()], args[1].GetType().Collate, coerString[args[1].Coercibility()], args[2].GetType().Collate, coerString[args[2].Coercibility()], funcName)
+		return collate.ErrIllegalMix3Collation.GenWithStackByArgs(args[0].GetType().GetCollate(), coerString[args[0].Coercibility()], args[1].GetType().GetCollate(), coerString[args[1].Coercibility()], args[2].GetType().GetCollate(), coerString[args[2].Coercibility()], funcName)
 	default:
 		return collate.ErrIllegalMixCollation.GenWithStackByArgs(funcName)
 	}

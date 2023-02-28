@@ -28,6 +28,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
@@ -38,15 +39,13 @@ const (
 
 // SingleTargetDataSink reports data to grpc servers.
 type SingleTargetDataSink struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	curRPCAddr string
+	ctx        context.Context
+	registerer DataSinkRegisterer
+	cancel     context.CancelFunc
 	conn       *grpc.ClientConn
 	sendTaskCh chan sendTask
-
 	registered *atomic.Bool
-	registerer DataSinkRegisterer
+	curRPCAddr string
 }
 
 // NewSingleTargetDataSink returns a new SingleTargetDataSink
@@ -94,8 +93,8 @@ func (ds *SingleTargetDataSink) recoverRun() {
 		}
 		ds.conn = nil
 	}()
-
 	for ds.run() {
+		continue
 	}
 }
 
@@ -254,7 +253,7 @@ func (ds *SingleTargetDataSink) sendBatchTopSQLRecord(ctx context.Context, recor
 		if err = stream.Send(&records[i]); err != nil {
 			return
 		}
-		sentCount += 1
+		sentCount++
 	}
 
 	// See https://pkg.go.dev/google.golang.org/grpc#ClientConn.NewStream for how to avoid leaking the stream
@@ -289,7 +288,7 @@ func (ds *SingleTargetDataSink) sendBatchSQLMeta(ctx context.Context, sqlMetas [
 		if err = stream.Send(&sqlMetas[i]); err != nil {
 			return
 		}
-		sentCount += 1
+		sentCount++
 	}
 
 	// See https://pkg.go.dev/google.golang.org/grpc#ClientConn.NewStream for how to avoid leaking the stream
@@ -324,7 +323,7 @@ func (ds *SingleTargetDataSink) sendBatchPlanMeta(ctx context.Context, planMetas
 		if err = stream.Send(&planMetas[i]); err != nil {
 			return err
 		}
-		sentCount += 1
+		sentCount++
 	}
 
 	// See https://pkg.go.dev/google.golang.org/grpc#ClientConn.NewStream for how to avoid leaking the stream
@@ -352,14 +351,14 @@ func (ds *SingleTargetDataSink) tryEstablishConnection(ctx context.Context, targ
 	return nil
 }
 
-func (ds *SingleTargetDataSink) dial(ctx context.Context, targetRPCAddr string) (*grpc.ClientConn, error) {
+func (*SingleTargetDataSink) dial(ctx context.Context, targetRPCAddr string) (*grpc.ClientConn, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 	return grpc.DialContext(
 		dialCtx,
 		targetRPCAddr,
 		grpc.WithBlock(),
-		grpc.WithInsecure(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithInitialWindowSize(grpcInitialWindowSize),
 		grpc.WithInitialConnWindowSize(grpcInitialConnWindowSize),
 		grpc.WithDefaultCallOptions(

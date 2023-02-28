@@ -13,20 +13,19 @@
 // limitations under the License.
 
 //go:build !codes
-// +build !codes
 
 package testkit
 
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"testing"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/session"
-	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/sqlexec"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -70,6 +69,15 @@ func (tk *AsyncTestKit) CloseSession(ctx context.Context) {
 	se.Close()
 }
 
+// GetStack gets the stacktrace.
+func GetStack() []byte {
+	const size = 4096
+	buf := make([]byte, size)
+	stackSize := runtime.Stack(buf, false)
+	buf = buf[:stackSize]
+	return buf
+}
+
 // ConcurrentRun run test in current.
 // - concurrent: controls the concurrent worker count.
 // - loops: controls run test how much times.
@@ -96,7 +104,7 @@ func (tk *AsyncTestKit) ConcurrentRun(
 		go func() {
 			defer func() {
 				r := recover()
-				tk.require.Nil(r, string(util.GetStack()))
+				tk.require.Nil(r, string(GetStack()))
 				doneList[w]()
 			}()
 
@@ -151,10 +159,7 @@ func (tk *AsyncTestKit) Exec(ctx context.Context, sql string, args ...interface{
 		return nil, err
 	}
 
-	params := make([]types.Datum, len(args))
-	for i := 0; i < len(params); i++ {
-		params[i] = types.NewDatum(args[i])
-	}
+	params := expression.Args2Expressions4Test(args...)
 
 	rs, err := se.ExecutePreparedStmt(ctx, stmtID, params)
 	if err != nil {
@@ -176,6 +181,21 @@ func (tk *AsyncTestKit) MustExec(ctx context.Context, sql string, args ...interf
 	if res != nil {
 		tk.require.NoError(res.Close())
 	}
+}
+
+// MustGetErrMsg executes a sql statement and assert its error message.
+func (tk *AsyncTestKit) MustGetErrMsg(ctx context.Context, sql string, errStr string) {
+	err := tk.ExecToErr(ctx, sql)
+	tk.require.EqualError(err, errStr)
+}
+
+// ExecToErr executes a sql statement and discard results.
+func (tk *AsyncTestKit) ExecToErr(ctx context.Context, sql string, args ...interface{}) error {
+	res, err := tk.Exec(ctx, sql, args...)
+	if res != nil {
+		tk.require.NoError(res.Close())
+	}
+	return err
 }
 
 // MustQuery query the statements and returns result rows.

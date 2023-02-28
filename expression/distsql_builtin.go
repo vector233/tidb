@@ -35,15 +35,10 @@ import (
 
 // PbTypeToFieldType converts tipb.FieldType to FieldType
 func PbTypeToFieldType(tp *tipb.FieldType) *types.FieldType {
-	return &types.FieldType{
-		Tp:      byte(tp.Tp),
-		Flag:    uint(tp.Flag),
-		Flen:    int(tp.Flen),
-		Decimal: int(tp.Decimal),
-		Charset: tp.Charset,
-		Collate: collate.ProtoToCollation(tp.Collate),
-		Elems:   tp.Elems,
-	}
+	ftb := types.NewFieldTypeBuilder()
+	ft := ftb.SetType(byte(tp.Tp)).SetFlag(uint(tp.Flag)).SetFlen(int(tp.Flen)).SetDecimal(int(tp.Decimal)).SetCharset(tp.Charset).SetCollate(collate.ProtoToCollation(tp.Collate)).BuildP()
+	ft.SetElems(tp.Elems)
+	return ft
 }
 
 func getSignatureByPB(ctx sessionctx.Context, sigCode tipb.ScalarFuncSig, tp *tipb.FieldType, args []Expression) (f builtinFunc, e error) {
@@ -57,7 +52,6 @@ func getSignatureByPB(ctx sessionctx.Context, sigCode tipb.ScalarFuncSig, tp *ti
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	base.tp = fieldTp
 	switch sigCode {
 	case tipb.ScalarFuncSig_CastIntAsInt:
 		f = &builtinCastIntAsIntSig{newBaseBuiltinCastFunc(base, false)}
@@ -669,9 +663,17 @@ func getSignatureByPB(ctx sessionctx.Context, sigCode tipb.ScalarFuncSig, tp *ti
 	case tipb.ScalarFuncSig_LikeSig:
 		f = &builtinLikeSig{base, nil, false, sync.Once{}}
 	case tipb.ScalarFuncSig_RegexpSig:
-		f = newBuiltinRegexpSig(base)
+		f = &builtinRegexpLikeFuncSig{regexpBaseFuncSig{base, regexpMemorizedSig{nil, nil}, sync.Once{}}}
 	case tipb.ScalarFuncSig_RegexpUTF8Sig:
-		f = newBuiltinRegexpUTF8Sig(base)
+		f = &builtinRegexpLikeFuncSig{regexpBaseFuncSig{base, regexpMemorizedSig{nil, nil}, sync.Once{}}}
+	case tipb.ScalarFuncSig_RegexpLikeSig:
+		f = &builtinRegexpLikeFuncSig{regexpBaseFuncSig{base, regexpMemorizedSig{nil, nil}, sync.Once{}}}
+	case tipb.ScalarFuncSig_RegexpSubstrSig:
+		f = &builtinRegexpSubstrFuncSig{regexpBaseFuncSig{base, regexpMemorizedSig{nil, nil}, sync.Once{}}}
+	case tipb.ScalarFuncSig_RegexpInStrSig:
+		f = &builtinRegexpInStrFuncSig{regexpBaseFuncSig{base, regexpMemorizedSig{nil, nil}, sync.Once{}}}
+	case tipb.ScalarFuncSig_RegexpReplaceSig:
+		f = &builtinRegexpReplaceFuncSig{regexpBaseFuncSig{base, regexpMemorizedSig{nil, nil}, sync.Once{}}}
 	case tipb.ScalarFuncSig_JsonExtractSig:
 		f = &builtinJSONExtractSig{base}
 	case tipb.ScalarFuncSig_JsonUnquoteSig:
@@ -1129,9 +1131,9 @@ func PBToExpr(expr *tipb.Expr, tps []*types.FieldType, sc *stmtctx.StatementCont
 	case tipb.ExprType_Null:
 		return &Constant{Value: types.Datum{}, RetType: types.NewFieldType(mysql.TypeNull)}, nil
 	case tipb.ExprType_Int64:
-		return convertInt(expr.Val)
+		return convertInt(expr.Val, expr.FieldType)
 	case tipb.ExprType_Uint64:
-		return convertUint(expr.Val)
+		return convertUint(expr.Val, expr.FieldType)
 	case tipb.ExprType_String:
 		return convertString(expr.Val, expr.FieldType)
 	case tipb.ExprType_Bytes:
@@ -1191,13 +1193,13 @@ func convertTime(data []byte, ftPB *tipb.FieldType, tz *time.Location) (*Constan
 		return nil, err
 	}
 	var t types.Time
-	t.SetType(ft.Tp)
-	t.SetFsp(ft.Decimal)
+	t.SetType(ft.GetType())
+	t.SetFsp(ft.GetDecimal())
 	err = t.FromPackedUint(v)
 	if err != nil {
 		return nil, err
 	}
-	if ft.Tp == mysql.TypeTimestamp && tz != time.UTC {
+	if ft.GetType() == mysql.TypeTimestamp && tz != time.UTC {
 		err = t.ConvertTimeZone(time.UTC, tz)
 		if err != nil {
 			return nil, err
@@ -1221,30 +1223,30 @@ func decodeValueList(data []byte) ([]Expression, error) {
 	return result, nil
 }
 
-func convertInt(val []byte) (*Constant, error) {
+func convertInt(val []byte, tp *tipb.FieldType) (*Constant, error) {
 	var d types.Datum
 	_, i, err := codec.DecodeInt(val)
 	if err != nil {
 		return nil, errors.Errorf("invalid int % x", val)
 	}
 	d.SetInt64(i)
-	return &Constant{Value: d, RetType: types.NewFieldType(mysql.TypeLonglong)}, nil
+	return &Constant{Value: d, RetType: PbTypeToFieldType(tp)}, nil
 }
 
-func convertUint(val []byte) (*Constant, error) {
+func convertUint(val []byte, tp *tipb.FieldType) (*Constant, error) {
 	var d types.Datum
 	_, u, err := codec.DecodeUint(val)
 	if err != nil {
 		return nil, errors.Errorf("invalid uint % x", val)
 	}
 	d.SetUint64(u)
-	return &Constant{Value: d, RetType: &types.FieldType{Tp: mysql.TypeLonglong, Flag: mysql.UnsignedFlag}}, nil
+	return &Constant{Value: d, RetType: PbTypeToFieldType(tp)}, nil
 }
 
 func convertString(val []byte, tp *tipb.FieldType) (*Constant, error) {
 	var d types.Datum
 	d.SetBytesAsString(val, collate.ProtoToCollation(tp.Collate), uint32(tp.Flen))
-	return &Constant{Value: d, RetType: types.NewFieldType(mysql.TypeVarString)}, nil
+	return &Constant{Value: d, RetType: PbTypeToFieldType(tp)}, nil
 }
 
 func convertFloat(val []byte, f32 bool) (*Constant, error) {

@@ -32,6 +32,7 @@ import (
 	"github.com/pingcap/tipb/go-tipb"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
 
@@ -86,6 +87,10 @@ func mockPlanBinaryDecoderFunc(plan string) (string, error) {
 	return plan, nil
 }
 
+func mockPlanBinaryCompressFunc(plan []byte) string {
+	return string(plan)
+}
+
 func TestTopSQLReporter(t *testing.T) {
 	err := cpuprofile.StartCPUProfiler()
 	require.NoError(t, err)
@@ -100,7 +105,7 @@ func TestTopSQLReporter(t *testing.T) {
 	})
 
 	topsqlstate.EnableTopSQL()
-	report := reporter.NewRemoteTopSQLReporter(mockPlanBinaryDecoderFunc)
+	report := reporter.NewRemoteTopSQLReporter(mockPlanBinaryDecoderFunc, mockPlanBinaryCompressFunc)
 	report.Start()
 	ds := reporter.NewSingleTargetDataSink(report)
 	ds.Start()
@@ -187,10 +192,11 @@ func TestMaxSQLAndPlanTest(t *testing.T) {
 	// Test for normal sql and plan
 	sql := "select * from t"
 	sqlDigest := mock.GenSQLDigest(sql)
-	topsql.AttachSQLInfo(ctx, sql, sqlDigest, "", nil, false)
+	topsql.AttachAndRegisterSQLInfo(ctx, sql, sqlDigest, false)
 	plan := "TableReader table:t"
 	planDigest := genDigest(plan)
-	topsql.AttachSQLInfo(ctx, sql, sqlDigest, plan, planDigest, false)
+	topsql.AttachSQLAndPlanInfo(ctx, sqlDigest, planDigest)
+	topsql.RegisterPlan(plan, planDigest)
 
 	cSQL := collector.GetSQL(sqlDigest.Bytes())
 	require.Equal(t, sql, cSQL)
@@ -200,10 +206,11 @@ func TestMaxSQLAndPlanTest(t *testing.T) {
 	// Test for huge sql and plan
 	sql = genStr(topsql.MaxSQLTextSize + 10)
 	sqlDigest = mock.GenSQLDigest(sql)
-	topsql.AttachSQLInfo(ctx, sql, sqlDigest, "", nil, false)
+	topsql.AttachAndRegisterSQLInfo(ctx, sql, sqlDigest, false)
 	plan = genStr(topsql.MaxBinaryPlanSize + 10)
 	planDigest = genDigest(plan)
-	topsql.AttachSQLInfo(ctx, sql, sqlDigest, plan, planDigest, false)
+	topsql.AttachSQLAndPlanInfo(ctx, sqlDigest, planDigest)
+	topsql.RegisterPlan(plan, planDigest)
 
 	cSQL = collector.GetSQL(sqlDigest.Bytes())
 	require.Equal(t, sql[:topsql.MaxSQLTextSize], cSQL)
@@ -220,7 +227,7 @@ func TestTopSQLPubSub(t *testing.T) {
 	topsqlstate.GlobalState.ReportIntervalSeconds.Store(1)
 
 	topsqlstate.EnableTopSQL()
-	report := reporter.NewRemoteTopSQLReporter(mockPlanBinaryDecoderFunc)
+	report := reporter.NewRemoteTopSQLReporter(mockPlanBinaryDecoderFunc, mockPlanBinaryCompressFunc)
 	report.Start()
 	defer report.Close()
 	topsql.SetupTopSQLForTest(report)
@@ -235,7 +242,7 @@ func TestTopSQLPubSub(t *testing.T) {
 	conn, err := grpc.Dial(
 		server.Address(),
 		grpc.WithBlock(),
-		grpc.WithInsecure(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:    10 * time.Second,
 			Timeout: 3 * time.Second,
@@ -339,7 +346,7 @@ func TestTopSQLPubSub(t *testing.T) {
 
 func TestPubSubWhenReporterIsStopped(t *testing.T) {
 	topsqlstate.EnableTopSQL()
-	report := reporter.NewRemoteTopSQLReporter(mockPlanBinaryDecoderFunc)
+	report := reporter.NewRemoteTopSQLReporter(mockPlanBinaryDecoderFunc, mockPlanBinaryCompressFunc)
 	report.Start()
 
 	server, err := mockServer.NewMockPubSubServer()
@@ -357,7 +364,7 @@ func TestPubSubWhenReporterIsStopped(t *testing.T) {
 	conn, err := grpc.Dial(
 		server.Address(),
 		grpc.WithBlock(),
-		grpc.WithInsecure(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:    10 * time.Second,
 			Timeout: 3 * time.Second,
@@ -379,10 +386,11 @@ func TestPubSubWhenReporterIsStopped(t *testing.T) {
 func mockExecuteSQL(sql, plan string) {
 	ctx := context.Background()
 	sqlDigest := mock.GenSQLDigest(sql)
-	topsql.AttachSQLInfo(ctx, sql, sqlDigest, "", nil, false)
+	topsql.AttachAndRegisterSQLInfo(ctx, sql, sqlDigest, false)
 	mockExecute(time.Millisecond * 100)
 	planDigest := genDigest(plan)
-	topsql.AttachSQLInfo(ctx, sql, sqlDigest, plan, planDigest, false)
+	topsql.AttachSQLAndPlanInfo(ctx, sqlDigest, planDigest)
+	topsql.RegisterPlan(plan, planDigest)
 	mockExecute(time.Millisecond * 300)
 }
 

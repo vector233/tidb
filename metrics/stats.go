@@ -128,4 +128,47 @@ var (
 			Help:      "Bucketed histogram of latency time (ms) of stats read during sync-load.",
 			Buckets:   prometheus.ExponentialBuckets(1, 2, 22), // 1ms ~ 1h
 		})
+
+	StatsCacheLRUCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "tidb",
+			Subsystem: "statistics",
+			Name:      "stats_cache_lru_op",
+			Help:      "Counter of lru for statsCache operation",
+		}, []string{LblType})
+
+	StatsCacheLRUGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "tidb",
+		Subsystem: "statistics",
+		Name:      "stats_cache_lru_val",
+		Help:      "gauge of stats cache lru value",
+	}, []string{LblType})
+
+	StatsHealthyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "tidb",
+		Subsystem: "statistics",
+		Name:      "stats_healthy",
+		Help:      "Gauge of stats healthy",
+	}, []string{LblType})
+
+	HistoricalStatsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "tidb",
+		Subsystem: "statistics",
+		Name:      "historical_stats",
+		Help:      "counter of the historical stats operation",
+	}, []string{LblType, LblResult})
+
+	PlanReplayerTaskCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "tidb",
+		Subsystem: "plan_replayer",
+		Name:      "task",
+		Help:      "counter of plan replayer captured task",
+	}, []string{LblType, LblResult})
+
+	PlanReplayerRegisterTaskGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "tidb",
+		Subsystem: "plan_replayer",
+		Name:      "register_task",
+		Help:      "gauge of plan replayer registered task",
+	})
 )

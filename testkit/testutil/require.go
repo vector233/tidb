@@ -13,11 +13,11 @@
 // limitations under the License.
 
 //go:build !codes
-// +build !codes
 
 package testutil
 
 import (
+	"math/rand"
 	"testing"
 
 	"github.com/pingcap/tidb/kv"
@@ -75,4 +75,15 @@ func CompareUnorderedStringSlice(a []string, b []string) bool {
 		}
 	}
 	return len(m) == 0
+}
+
+var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+// RandStringRunes generate random string of length n.
+func RandStringRunes(n int) string {
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = letterRunes[rand.Intn(len(letterRunes))]
+	}
+	return string(b)
 }

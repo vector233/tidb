@@ -16,13 +16,13 @@ package expression
 
 import (
 	"fmt"
+	"unsafe"
 
 	"github.com/pingcap/tidb/parser/mysql"
 	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/collate"
@@ -31,9 +31,9 @@ import (
 // NewOne stands for a number 1.
 func NewOne() *Constant {
 	retT := types.NewFieldType(mysql.TypeTiny)
-	retT.Flag |= mysql.UnsignedFlag // shrink range to avoid integral promotion
-	retT.Flen = 1
-	retT.Decimal = 0
+	retT.AddFlag(mysql.UnsignedFlag) // shrink range to avoid integral promotion
+	retT.SetFlen(1)
+	retT.SetDecimal(0)
 	return &Constant{
 		Value:   types.NewDatum(1),
 		RetType: retT,
@@ -43,11 +43,23 @@ func NewOne() *Constant {
 // NewZero stands for a number 0.
 func NewZero() *Constant {
 	retT := types.NewFieldType(mysql.TypeTiny)
-	retT.Flag |= mysql.UnsignedFlag // shrink range to avoid integral promotion
-	retT.Flen = 1
-	retT.Decimal = 0
+	retT.AddFlag(mysql.UnsignedFlag) // shrink range to avoid integral promotion
+	retT.SetFlen(1)
+	retT.SetDecimal(0)
 	return &Constant{
 		Value:   types.NewDatum(0),
+		RetType: retT,
+	}
+}
+
+// NewUInt64Const stands for constant of a given number.
+func NewUInt64Const(num int) *Constant {
+	retT := types.NewFieldType(mysql.TypeLonglong)
+	retT.AddFlag(mysql.UnsignedFlag) // shrink range to avoid integral promotion
+	retT.SetFlen(mysql.MaxIntWidth)
+	retT.SetDecimal(0)
+	return &Constant{
+		Value:   types.NewDatum(num),
 		RetType: retT,
 	}
 }
@@ -55,8 +67,8 @@ func NewZero() *Constant {
 // NewNull stands for null constant.
 func NewNull() *Constant {
 	retT := types.NewFieldType(mysql.TypeTiny)
-	retT.Flen = 1
-	retT.Decimal = 0
+	retT.SetFlen(1)
+	retT.SetDecimal(0)
 	return &Constant{
 		Value:   types.NewDatum(nil),
 		RetType: retT,
@@ -226,7 +238,7 @@ func (c *Constant) EvalInt(ctx sessionctx.Context, row chunk.Row) (int64, bool, 
 	if !lazy {
 		dt = c.Value
 	}
-	if c.GetType().Tp == mysql.TypeNull || dt.IsNull() {
+	if c.GetType().GetType() == mysql.TypeNull || dt.IsNull() {
 		return 0, true, nil
 	} else if dt.Kind() == types.KindBinaryLiteral {
 		val, err := dt.GetBinaryLiteral().ToInt(ctx.GetSessionVars().StmtCtx)
@@ -250,7 +262,7 @@ func (c *Constant) EvalReal(ctx sessionctx.Context, row chunk.Row) (float64, boo
 	if !lazy {
 		dt = c.Value
 	}
-	if c.GetType().Tp == mysql.TypeNull || dt.IsNull() {
+	if c.GetType().GetType() == mysql.TypeNull || dt.IsNull() {
 		return 0, true, nil
 	}
 	if c.GetType().Hybrid() || dt.Kind() == types.KindBinaryLiteral || dt.Kind() == types.KindString {
@@ -269,7 +281,7 @@ func (c *Constant) EvalString(ctx sessionctx.Context, row chunk.Row) (string, bo
 	if !lazy {
 		dt = c.Value
 	}
-	if c.GetType().Tp == mysql.TypeNull || dt.IsNull() {
+	if c.GetType().GetType() == mysql.TypeNull || dt.IsNull() {
 		return "", true, nil
 	}
 	res, err := dt.ToString()
@@ -285,7 +297,7 @@ func (c *Constant) EvalDecimal(ctx sessionctx.Context, row chunk.Row) (*types.My
 	if !lazy {
 		dt = c.Value
 	}
-	if c.GetType().Tp == mysql.TypeNull || dt.IsNull() {
+	if c.GetType().GetType() == mysql.TypeNull || dt.IsNull() {
 		return nil, true, nil
 	}
 	res, err := dt.ToDecimal(ctx.GetSessionVars().StmtCtx)
@@ -294,8 +306,8 @@ func (c *Constant) EvalDecimal(ctx sessionctx.Context, row chunk.Row) (*types.My
 	}
 	// The decimal may be modified during plan building.
 	_, frac := res.PrecisionAndFrac()
-	if frac < c.GetType().Decimal {
-		err = res.Round(res, c.GetType().Decimal, types.ModeHalfEven)
+	if frac < c.GetType().GetDecimal() {
+		err = res.Round(res, c.GetType().GetDecimal(), types.ModeHalfUp)
 	}
 	return res, false, err
 }
@@ -309,7 +321,7 @@ func (c *Constant) EvalTime(ctx sessionctx.Context, row chunk.Row) (val types.Ti
 	if !lazy {
 		dt = c.Value
 	}
-	if c.GetType().Tp == mysql.TypeNull || dt.IsNull() {
+	if c.GetType().GetType() == mysql.TypeNull || dt.IsNull() {
 		return types.ZeroTime, true, nil
 	}
 	return dt.GetMysqlTime(), false, nil
@@ -324,23 +336,23 @@ func (c *Constant) EvalDuration(ctx sessionctx.Context, row chunk.Row) (val type
 	if !lazy {
 		dt = c.Value
 	}
-	if c.GetType().Tp == mysql.TypeNull || dt.IsNull() {
+	if c.GetType().GetType() == mysql.TypeNull || dt.IsNull() {
 		return types.Duration{}, true, nil
 	}
 	return dt.GetMysqlDuration(), false, nil
 }
 
 // EvalJSON returns JSON representation of Constant.
-func (c *Constant) EvalJSON(ctx sessionctx.Context, row chunk.Row) (json.BinaryJSON, bool, error) {
+func (c *Constant) EvalJSON(ctx sessionctx.Context, row chunk.Row) (types.BinaryJSON, bool, error) {
 	dt, lazy, err := c.getLazyDatum(row)
 	if err != nil {
-		return json.BinaryJSON{}, false, err
+		return types.BinaryJSON{}, false, err
 	}
 	if !lazy {
 		dt = c.Value
 	}
-	if c.GetType().Tp == mysql.TypeNull || dt.IsNull() {
-		return json.BinaryJSON{}, true, nil
+	if c.GetType().GetType() == mysql.TypeNull || dt.IsNull() {
+		return types.BinaryJSON{}, true, nil
 	}
 	return dt.GetMysqlJSON(), false, nil
 }
@@ -422,6 +434,11 @@ func (c *Constant) resolveIndicesByVirtualExpr(_ *Schema) bool {
 	return true
 }
 
+// RemapColumn remaps columns with provided mapping and returns new expression
+func (c *Constant) RemapColumn(_ map[int64]*Column) (Expression, error) {
+	return c, nil
+}
+
 // Vectorized returns if this expression supports vectorized evaluation.
 func (c *Constant) Vectorized() bool {
 	if c.DeferredExpr != nil {
@@ -449,4 +466,19 @@ func (c *Constant) Coercibility() Coercibility {
 		c.SetCoercibility(deriveCoercibilityForConstant(c))
 	}
 	return c.collationInfo.Coercibility()
+}
+
+const emptyConstantSize = int64(unsafe.Sizeof(Constant{}))
+
+// MemoryUsage return the memory usage of Constant
+func (c *Constant) MemoryUsage() (sum int64) {
+	if c == nil {
+		return
+	}
+
+	sum = emptyConstantSize + c.Value.MemUsage() + int64(cap(c.hashcode))
+	if c.RetType != nil {
+		sum += c.RetType.MemoryUsage()
+	}
+	return
 }

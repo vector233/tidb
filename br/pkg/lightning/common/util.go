@@ -16,14 +16,16 @@ package common
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -35,6 +37,7 @@ import (
 	"github.com/pingcap/tidb/br/pkg/utils"
 	tmysql "github.com/pingcap/tidb/errno"
 	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/table/tables"
 	"go.uber.org/zap"
 )
 
@@ -46,37 +49,55 @@ const (
 
 // MySQLConnectParam records the parameters needed to connect to a MySQL database.
 type MySQLConnectParam struct {
-	Host             string
-	Port             int
-	User             string
-	Password         string
-	SQLMode          string
-	MaxAllowedPacket uint64
-	TLS              string
-	Vars             map[string]string
+	Host                     string
+	Port                     int
+	User                     string
+	Password                 string
+	SQLMode                  string
+	MaxAllowedPacket         uint64
+	TLSConfig                *tls.Config
+	AllowFallbackToPlaintext bool
+	Net                      string
+	Vars                     map[string]string
 }
 
-func (param *MySQLConnectParam) ToDSN() string {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/?charset=utf8mb4&sql_mode='%s'&maxAllowedPacket=%d&tls=%s",
-		param.User, param.Password, param.Host, param.Port,
-		param.SQLMode, param.MaxAllowedPacket, param.TLS)
+func (param *MySQLConnectParam) ToDriverConfig() *mysql.Config {
+	cfg := mysql.NewConfig()
+	cfg.Params = make(map[string]string)
+
+	cfg.User = param.User
+	cfg.Passwd = param.Password
+	cfg.Net = "tcp"
+	if param.Net != "" {
+		cfg.Net = param.Net
+	}
+	cfg.Addr = net.JoinHostPort(param.Host, strconv.Itoa(param.Port))
+	cfg.Params["charset"] = "utf8mb4"
+	cfg.Params["sql_mode"] = fmt.Sprintf("'%s'", param.SQLMode)
+	cfg.MaxAllowedPacket = int(param.MaxAllowedPacket)
+
+	cfg.TLS = param.TLSConfig
+	cfg.AllowFallbackToPlaintext = param.AllowFallbackToPlaintext
 
 	for k, v := range param.Vars {
-		dsn += fmt.Sprintf("&%s='%s'", k, url.QueryEscape(v))
+		cfg.Params[k] = fmt.Sprintf("'%s'", v)
 	}
-
-	return dsn
+	return cfg
 }
 
-func tryConnectMySQL(dsn string) (*sql.DB, error) {
-	driverName := "mysql"
-	failpoint.Inject("MockMySQLDriver", func(val failpoint.Value) {
-		driverName = val.(string)
+func tryConnectMySQL(cfg *mysql.Config) (*sql.DB, error) {
+	failpoint.Inject("MustMySQLPassword", func(val failpoint.Value) {
+		pwd := val.(string)
+		if cfg.Passwd != pwd {
+			failpoint.Return(nil, &mysql.MySQLError{Number: tmysql.ErrAccessDenied, Message: "access denied"})
+		}
+		failpoint.Return(nil, nil)
 	})
-	db, err := sql.Open(driverName, dsn)
+	c, err := mysql.NewConnector(cfg)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	db := sql.OpenDB(c)
 	if err = db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, errors.Trace(err)
@@ -86,13 +107,9 @@ func tryConnectMySQL(dsn string) (*sql.DB, error) {
 
 // ConnectMySQL connects MySQL with the dsn. If access is denied and the password is a valid base64 encoding,
 // we will try to connect MySQL with the base64 decoding of the password.
-func ConnectMySQL(dsn string) (*sql.DB, error) {
-	cfg, err := mysql.ParseDSN(dsn)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
+func ConnectMySQL(cfg *mysql.Config) (*sql.DB, error) {
 	// Try plain password first.
-	db, firstErr := tryConnectMySQL(dsn)
+	db, firstErr := tryConnectMySQL(cfg)
 	if firstErr == nil {
 		return db, nil
 	}
@@ -101,9 +118,9 @@ func ConnectMySQL(dsn string) (*sql.DB, error) {
 		// If password is encoded by base64, try the decoded string as well.
 		if password, decodeErr := base64.StdEncoding.DecodeString(cfg.Passwd); decodeErr == nil && string(password) != cfg.Passwd {
 			cfg.Passwd = string(password)
-			db, err = tryConnectMySQL(cfg.FormatDSN())
+			db2, err := tryConnectMySQL(cfg)
 			if err == nil {
-				return db, nil
+				return db2, nil
 			}
 		}
 	}
@@ -112,7 +129,7 @@ func ConnectMySQL(dsn string) (*sql.DB, error) {
 }
 
 func (param *MySQLConnectParam) Connect() (*sql.DB, error) {
-	db, err := ConnectMySQL(param.ToDSN())
+	db, err := ConnectMySQL(param.ToDriverConfig())
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -168,7 +185,7 @@ outside:
 		// do not retry NotFound error
 		case errors.IsNotFound(err):
 			break outside
-		case utils.IsRetryableError(err):
+		case IsRetryableError(err):
 			logger.Warn(purpose+" failed but going to try again", log.ShortError(err))
 			continue
 		default:
@@ -292,7 +309,7 @@ func InterpolateMySQLString(s string) string {
 }
 
 // TableExists return whether table with specified name exists in target db
-func TableExists(ctx context.Context, db *sql.DB, schema, table string) (bool, error) {
+func TableExists(ctx context.Context, db utils.QueryExecutor, schema, table string) (bool, error) {
 	query := "SELECT 1 from INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
 	var exist string
 	err := db.QueryRowContext(ctx, query, schema, table).Scan(&exist)
@@ -303,6 +320,21 @@ func TableExists(ctx context.Context, db *sql.DB, schema, table string) (bool, e
 		return false, nil
 	default:
 		return false, errors.Annotatef(err, "check table exists failed")
+	}
+}
+
+// SchemaExists return whether schema with specified name exists.
+func SchemaExists(ctx context.Context, db utils.QueryExecutor, schema string) (bool, error) {
+	query := "SELECT 1 from INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?"
+	var exist string
+	err := db.QueryRowContext(ctx, query, schema).Scan(&exist)
+	switch {
+	case err == nil:
+		return true, nil
+	case err == sql.ErrNoRows:
+		return false, nil
+	default:
+		return false, errors.Annotatef(err, "check schema exists failed")
 	}
 }
 
@@ -368,6 +400,11 @@ func TableHasAutoRowID(info *model.TableInfo) bool {
 	return !info.PKIsHandle && !info.IsCommonHandle
 }
 
+// TableHasAutoID return whether table has auto generated id.
+func TableHasAutoID(info *model.TableInfo) bool {
+	return TableHasAutoRowID(info) || info.GetAutoIncrementColInfo() != nil || info.ContainsAutoRandomBits()
+}
+
 // StringSliceEqual checks if two string slices are equal.
 func StringSliceEqual(a, b []string) bool {
 	if len(a) != len(b) {
@@ -379,4 +416,23 @@ func StringSliceEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// GetAutoRandomColumn return the column with auto_random, return nil if the table doesn't have it.
+// todo: better put in ddl package, but this will cause import cycle since ddl package import lightning
+func GetAutoRandomColumn(tblInfo *model.TableInfo) *model.ColumnInfo {
+	if !tblInfo.ContainsAutoRandomBits() {
+		return nil
+	}
+	if tblInfo.PKIsHandle {
+		return tblInfo.GetPkColInfo()
+	} else if tblInfo.IsCommonHandle {
+		pk := tables.FindPrimaryIndex(tblInfo)
+		if pk == nil {
+			return nil
+		}
+		offset := pk.Columns[0].Offset
+		return tblInfo.Columns[offset]
+	}
+	return nil
 }

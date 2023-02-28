@@ -20,7 +20,7 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
-	"github.com/pingcap/tidb/ddl"
+	"github.com/pingcap/tidb/ddl/internal/callback"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/parser/model"
 	"github.com/pingcap/tidb/parser/mysql"
@@ -39,8 +39,7 @@ func TestRepairTable(t *testing.T) {
 		require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/infoschema/repairFetchCreateTable"))
 	}()
 
-	store, dom, clean := testkit.CreateMockStoreAndDomainWithSchemaLease(t, repairTableLease)
-	defer clean()
+	store, dom := testkit.CreateMockStoreAndDomainWithSchemaLease(t, repairTableLease)
 	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("use test")
 
@@ -102,7 +101,7 @@ func TestRepairTable(t *testing.T) {
 	// Repaired tableInfo has been filtered by `domain.InfoSchema()`, so get it in repairInfo.
 	originTableInfo, _ := domainutil.RepairInfo.GetRepairedTableInfoByTableName("test", "origin")
 
-	hook := &ddl.TestDDLCallback{Do: dom}
+	hook := &callback.TestDDLCallback{Do: dom}
 	var repairErr error
 	hook.OnJobRunBeforeExported = func(job *model.Job) {
 		if job.Type != model.ActionRepairTable {
@@ -145,10 +144,10 @@ func TestRepairTable(t *testing.T) {
 	require.Equal(t, originTableInfo.Columns[0].ID, repairTable.Meta().Indices[0].ID)
 	require.Equal(t, originTableInfo.AutoIncID, repairTable.Meta().AutoIncID)
 
-	require.Equal(t, mysql.TypeLong, repairTable.Meta().Columns[0].Tp)
-	require.Equal(t, mysql.TypeVarchar, repairTable.Meta().Columns[1].Tp)
-	require.Equal(t, 5, repairTable.Meta().Columns[1].Flen)
-	require.Equal(t, mysql.TypeLong, repairTable.Meta().Columns[2].Tp)
+	require.Equal(t, mysql.TypeLong, repairTable.Meta().Columns[0].GetType())
+	require.Equal(t, mysql.TypeVarchar, repairTable.Meta().Columns[1].GetType())
+	require.Equal(t, 5, repairTable.Meta().Columns[1].GetFlen())
+	require.Equal(t, mysql.TypeLong, repairTable.Meta().Columns[2].GetType())
 
 	// Exec the show create table statement to make sure new tableInfo has been set.
 	result := tk.MustQuery("show create table origin")
@@ -169,8 +168,7 @@ func TestRepairTableWithPartition(t *testing.T) {
 	defer func() {
 		require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/infoschema/repairFetchCreateTable"))
 	}()
-	store, clean := testkit.CreateMockStoreWithSchemaLease(t, repairTableLease)
-	defer clean()
+	store := testkit.CreateMockStoreWithSchemaLease(t, repairTableLease)
 	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists origin")

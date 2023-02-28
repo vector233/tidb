@@ -25,17 +25,15 @@ import (
 	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/domain/infosync"
+	"github.com/pingcap/tidb/keyspace"
 	"github.com/pingcap/tidb/meta/autoid"
-	"github.com/pingcap/tidb/parser/model"
-	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/testkit"
-	"github.com/pingcap/tidb/util/testbridge"
+	"github.com/pingcap/tidb/testkit/testsetup"
 	"github.com/tikv/client-go/v2/tikv"
 	"go.uber.org/goleak"
 )
 
 func TestMain(m *testing.M) {
-	testbridge.SetupForCommonTest()
+	testsetup.SetupForCommonTest()
 	tikv.EnableFailpoints()
 
 	domain.SchemaOutOfDateRetryInterval.Store(50 * time.Millisecond)
@@ -43,18 +41,21 @@ func TestMain(m *testing.M) {
 
 	autoid.SetStep(5000)
 	ddl.ReorgWaitTimeout = 30 * time.Millisecond
+	ddl.RetrySQLInterval = 30 * time.Millisecond
+	ddl.CheckBackfillJobFinishInterval = 50 * time.Millisecond
+	ddl.RunInGoTest = true
 	ddl.SetBatchInsertDeleteRangeSize(2)
 
 	config.UpdateGlobal(func(conf *config.Config) {
 		// Test for table lock.
 		conf.EnableTableLock = true
-		conf.Log.SlowThreshold = 10000
+		conf.Instance.SlowThreshold = 10000
 		conf.TiKVClient.AsyncCommit.SafeWindow = 0
 		conf.TiKVClient.AsyncCommit.AllowedClockDrift = 0
 		conf.Experimental.AllowsExpressionIndex = true
 	})
 
-	_, err := infosync.GlobalInfoSyncerInit(context.Background(), "t", func() uint64 { return 1 }, nil, true)
+	_, err := infosync.GlobalInfoSyncerInit(context.Background(), "t", func() uint64 { return 1 }, nil, nil, nil, keyspace.CodecV1, true)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "ddl: infosync.GlobalInfoSyncerInit: %v\n", err)
 		os.Exit(1)
@@ -62,47 +63,13 @@ func TestMain(m *testing.M) {
 
 	opts := []goleak.Option{
 		goleak.IgnoreTopFunction("github.com/golang/glog.(*loggingT).flushDaemon"),
+		goleak.IgnoreTopFunction("github.com/lestrrat-go/httprc.runFetchWorker"),
 		goleak.IgnoreTopFunction("go.etcd.io/etcd/client/pkg/v3/logutil.(*MergeLogger).outputLoop"),
+		goleak.IgnoreTopFunction("github.com/tikv/client-go/v2/txnkv/transaction.keepAlive"),
 		goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"),
+		goleak.IgnoreTopFunction("internal/poll.runtime_pollWait"),
+		goleak.IgnoreTopFunction("net/http.(*persistConn).writeLoop"),
 	}
 
 	goleak.VerifyTestMain(m, opts...)
-}
-
-func wrapJobIDExtCallback(oldCallback ddl.Callback) *testDDLJobIDCallback {
-	return &testDDLJobIDCallback{
-		Callback: oldCallback,
-		jobID:    0,
-	}
-}
-
-func setupJobIDExtCallback(ctx sessionctx.Context) (jobExt *testDDLJobIDCallback, tearDown func()) {
-	dom := domain.GetDomain(ctx)
-	originHook := dom.DDL().GetHook()
-	jobIDExt := wrapJobIDExtCallback(originHook)
-	dom.DDL().SetHook(jobIDExt)
-	return jobIDExt, func() {
-		dom.DDL().SetHook(originHook)
-	}
-}
-
-func checkDelRangeAdded(tk *testkit.TestKit, jobID int64, elemID int64) {
-	query := `select sum(cnt) from
-	(select count(1) cnt from mysql.gc_delete_range where job_id = ? and element_id = ? union
-	select count(1) cnt from mysql.gc_delete_range_done where job_id = ? and element_id = ?) as gdr;`
-	tk.MustQuery(query, jobID, elemID, jobID, elemID).Check(testkit.Rows("1"))
-}
-
-type testDDLJobIDCallback struct {
-	ddl.Callback
-	jobID int64
-}
-
-func (t *testDDLJobIDCallback) OnJobUpdated(job *model.Job) {
-	if t.jobID == 0 {
-		t.jobID = job.ID
-	}
-	if t.Callback != nil {
-		t.Callback.OnJobUpdated(job)
-	}
 }
